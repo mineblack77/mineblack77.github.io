@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Serial ↔ MIDI RAW Bridge</title>
+    <!-- MidiPlayerJS を完全にインラインで完結させるためのCDN読み込み。
+         スタンドアロンとして動作するように、パースに必要なメインライブラリのみを読み込みます。 -->
+    <script src="https://cdn.jsdelivr.net/npm/midi-player-js@2.0.17/browser/midiplayer.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f6f9; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        h1 { font-size: 1.5rem; text-align: center; color: #1a73e8; margin-top: 0; }
+        h2 { font-size: 1.1rem; margin-top: 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 8px; color: #5f6368; }
+        button { background: #1a73e8; color: white; border: none; padding: 10px 16px; font-size: 0.95rem; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 8px; transition: background 0.2s; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.stop { background: #d93025; }
+        select, input[type="file"] { width: 100%; padding: 10px; margin-top: 8px; border: 1px solid #dadce0; border-radius: 6px; background: #fafafa; box-sizing: border-box; }
+        .status { font-weight: bold; margin-top: 10px; font-size: 0.9rem; }
+        .status.ok { color: #137333; }
+        .status.err { color: #c5221f; }
+        .control-group { display: flex; gap: 10px; margin-top: 8px; }
+        #log { background: #202124; color: #34a853; font-family: monospace; font-size: 0.85rem; padding: 12px; border-radius: 8px; height: 180px; overflow-y: auto; white-space: pre-line; box-sizing: border-box; }
+        .info-text { font-size: 0.8rem; color: #70757a; margin-top: 4px; line-height: 1.4; }
+    </style>
+</head>
+<body>
+
+    <h1>Web Serial ↔ MIDI RAW Bridge</h1>
+
+    <!-- 1. シリアル通信設定 -->
+    <div class="card">
+        <h2>1. Arduino接続 (シリアル)</h2>
+        <button id="btn-serial">シリアルポートを開く</button>
+        <div id="serial-status" class="status err">未接続 (115200 bps)</div>
+        <p class="info-text">※Androidの場合は、Web Serial APIに対応したブラウザ（Opera等）を使用してください。</p>
+    </div>
+
+    <!-- 2. リアルタイムMIDI入力設定 -->
+    <div class="card">
+        <h2>2. リアルタイムMIDIデバイス演奏</h2>
+        <label for="midi-in-select">入力MIDIデバイスを選択:</label>
+        <select id="midi-in-select" disabled>
+            <option value="">-- デバイス未検出 --</option>
+        </select>
+        <div id="midi-status" class="status">MIDI未初期化</div>
+        <p class="info-text">接続された鍵盤のベロシティ、ピッチベンド、プログラムチェンジ、CC情報などを、一切加工せず生のまま瞬時にArduinoへ転送します。</p>
+    </div>
+
+    <!-- 3. MIDIファイル再生設定 -->
+    <div class="card">
+        <h2>3. MIDIファイルの再生転送</h2>
+        <input type="file" id="file-input" accept=".mid,.midi" disabled>
+        <div class="control-group">
+            <button id="btn-play" disabled>再生</button>
+            <button id="btn-stop" class="stop" disabled>停止</button>
+        </div>
+        <div id="player-status" class="status">ファイルが選択されていません</div>
+        <div id="tempo-display" class="info-text" style="font-weight: bold; margin-top: 4px;">現在のテンポ: -- BPM</div>
+        <p class="info-text">ファイル内のテンポ変更イベント（Set Tempo）をブラウザ側でリアルタイムに解析・追従しながら、Arduino側のシンセが処理できる形に整えてRAW送信します。（メタデータは自動で間引かれます）</p>
+    </div>
+
+    <!-- 4. ログ表示 -->
+    <div class="card">
+        <h2>通信ログ</h2>
+        <div id="log">ここに通信ログが表示されます...</div>
+    </div>
+
+    <script>
+        let serialPort = null;
+        let writer = null;
+        let midiAccess = null;
+        let activeInput = null;
+        let player = null;
+
+        // UI要素
+        const btnSerial = document.getElementById('btn-serial');
+        const serialStatus = document.getElementById('serial-status');
+        const midiInSelect = document.getElementById('midi-in-select');
+        const midiStatus = document.getElementById('midi-status');
+        const fileInput = document.getElementById('file-input');
+        const btnPlay = document.getElementById('btn-play');
+        const btnStop = document.getElementById('btn-stop');
+        const playerStatus = document.getElementById('player-status');
+        const tempoDisplay = document.getElementById('tempo-display');
+        const logDiv = document.getElementById('log');
+
+        function log(text) {
+            const now = new Date();
+            const timeStr = now.toTimeString().split(' ')[0];
+            logDiv.innerText += `[${timeStr}] ${text}
+`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        // --- 1. シリアル通信処理 ---
+        btnSerial.addEventListener('click', async () => {
+            if (serialPort) {
+                // 切断処理
+                try {
+                    if (writer) { writer.releaseLock(); writer = null; }
+                    await serialPort.close();
+                    serialPort = null;
+                    serialStatus.innerText = "未接続 (115200 bps)";
+                    serialStatus.className = "status err";
+                    btnSerial.innerText = "シリアルポートを開く";
+                    log("シリアルポートを閉じました。");
+                } catch (e) {
+                    log("切断エラー: " + e.message);
+                }
+                return;
+            }
+
+            try {
+                if (!navigator.serial) {
+                    throw new Error("このブラウザはWeb Serial APIに対応していません。AndroidではOpera等をお試しください。");
+                }
+                serialPort = await navigator.serial.requestPort({ filters: usbFilters });
+                // Arduino側のシンセコードと合わせるため115200bpsでオープン
+                await serialPort.open({ baudRate: 115200 });
+                writer = serialPort.writable.getWriter();
+
+                serialStatus.innerText = "接続完了 (115200 bps)";
+                serialStatus.className = "status ok";
+                btnSerial.innerText = "シリアルポートを閉じる";
+                log("シリアル通信が確立しました。Arduinoへ送信可能です。");
+
+                // シリアルが繋がったらMIDI関係を有効化
+                initMidi();
+                fileInput.disabled = false;
+            } catch (e) {
+                serialStatus.innerText = "接続失敗: " + e.message;
+                serialStatus.className = "status err";
+                log("シリアルエラー: " + e.message);
+            }
+        });
+
+        // 共通データ送信関数
+        function sendRawMidi(bytes) {
+            if (writer) {
+                writer.write(new Uint8Array(bytes));
+            }
+        }
+
+        // --- 2. リアルタイムMIDI入力処理 ---
+        async function initMidi() {
+            try {
+                if (!navigator.requestMIDIAccess) {
+                    throw new Error("Web MIDI APIに対応していません。");
+                }
+                midiAccess = await navigator.requestMIDIAccess({ sysex: true });
+                midiStatus.innerText = "MIDI利用可能";
+                midiStatus.className = "status ok";
+                log("Web MIDI APIの初期化に成功しました。");
+
+                updateMidiInputs();
+                midiAccess.onstatechange = updateMidiInputs;
+                midiInSelect.disabled = false;
+            } catch (e) {
+                midiStatus.innerText = "MIDI初期化失敗: " + e.message;
+                midiStatus.className = "status err";
+                log("MIDIエラー: " + e.message);
+            }
+        }
+
+        function updateMidiInputs() {
+            const inputs = midiAccess.inputs.values();
+            midiInSelect.innerHTML = '<option value="">-- 入力デバイスを選択してください --</option>';
+            let hasInputs = false;
+
+            for (let input of inputs) {
+                hasInputs = true;
+                const opt = document.createElement('option');
+                opt.value = input.id;
+                opt.innerText = input.name;
+                midiInSelect.appendChild(opt);
+            }
+
+            if (!hasInputs) {
+                midiStatus.innerText = "MIDIデバイスが見つかりません";
+                midiStatus.className = "status err";
+            }
+        }
+
+        midiInSelect.addEventListener('change', () => {
+            if (activeInput) {
+                activeInput.onmidimessage = null;
+                activeInput = null;
+            }
+
+            const selectedId = midiInSelect.value;
+            if (!selectedId) return;
+
+            activeInput = midiAccess.inputs.get(selectedId);
+            if (activeInput) {
+                log(`MIDI入力ターゲット変更 -> ${activeInput.name}`);
+                
+                // リアルタイム演奏イベント (ピッチベンド、ベロシティ、CC、SysEx、ProgChange全てそのままキャプチャ)
+                activeInput.onmidimessage = (event) => {
+                    // event.data (Uint8Array) をそのまま加工せずRAWデータストリームとしてArduinoへ送出
+                    sendRawMidi(event.data);
+                    
+                    // 視覚的フィードバック用の簡易ログ (ノートON/OFF、CC、ピッチベンドなど)
+                    const sb = event.data[0];
+                    if (sb >= 0x80 && sb <= 0xEF) {
+                        // チャンネルメッセージを16進数で軽く表示
+                        const hexStr = Array.from(event.data).map(b => '0x' + b.toString(16).toUpperCase()).join(', ');
+                        log(`[Live MIDI] 送信: [${hexStr}]`);
+                    }
+                };
+            }
+        });
+
+
+        // --- 3. MIDIファイル再生 & テンポ追従処理 ---
+        // MidiPlayerJSの初期化
+        player = new MidiPlayer.Player(function(event) {
+            // 再生中の個別MIDIイベントコールバック
+            // event.name !== 'Meta Event' で、テキストや歌詞、内部テンポ定義等の「シリアル回線に流すべきではないメタデータ」を自動的に間引きます。
+            if (event.name && event.name !== 'Meta Event' && event.name !== 'Sequence Number') {
+                
+                // MidiPlayerJSによって1つにまとめられた生のRAW MIDIバイト（ステータスバイト＋データバイト）を取得
+                // これによりピッチベンド(0xE0系)、プログラムチェンジ(0xC0系)等すべてのシステムチェンネルメッセージが網羅されます
+                const rawBytes = event.getRawData();
+                if (rawBytes && rawBytes.length > 0) {
+                    sendRawMidi(rawBytes);
+                    
+                    // 演奏ログが溢れすぎないよう、ノートON/OFF、プログラムチェンジ、ピッチベンドなどを視覚化
+                    if(event.name === 'Note on' || event.name === 'Note off' || event.name === 'Program Change' || event.name === 'Pitch Bend') {
+                        log(`[File] ${event.name} (Ch.${event.track}): ${event.noteName || ''} val:${event.value || ''}`);
+                    }
+                }
+            }
+        });
+
+        // プレイヤーの内部ステータス監視
+        player.on('playing', (currentTick) => {
+            // テンポ変更に追従して表示を更新
+            tempoDisplay.innerText = `現在のテンポ: ${Math.round(player.tempo)} BPM`;
+        });
+
+        player.on('endOfFile', () => {
+            log("MIDIファイルの再生が完了しました。");
+            playerStatus.innerText = "再生終了";
+            btnPlay.disabled = false;
+            btnStop.disabled = false;
+        });
+
+        // ファイル選択時のイベント
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                try {
+                    // MidiPlayerJSにArrayBufferとして流し込む
+                    player.loadArrayBuffer(event.target.result);
+                    playerStatus.innerText = `読み込み完了: ${file.name}`;
+                    playerStatus.className = "status ok";
+                    tempoDisplay.innerText = `初期テンポ: ${Math.round(player.tempo)} BPM`;
+                    btnPlay.disabled = false;
+                    log(`MIDIファイルをパースしました: ${file.name} (初期テンポ: ${player.tempo} BPM)`);
+                } catch (err) {
+                    playerStatus.innerText = "解析失敗: 有効な標準MIDIファイルではありません。";
+                    playerStatus.className = "status err";
+                    log("ファイル解析エラー: " + err.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        // 再生ボタン
+        btnPlay.addEventListener('click', () => {
+            if (player) {
+                player.play();
+                playerStatus.innerText = "再生中...";
+                btnPlay.disabled = true;
+                btnStop.disabled = false;
+                log("ファイルの再生を開始しました。");
+            }
+        });
+
+        // 停止ボタン
+        btnStop.addEventListener('click', () => {
+            if (player) {
+                player.stop();
+                playerStatus.innerText = "停止中";
+                btnPlay.disabled = false;
+                btnStop.disabled = true;
+                log("ファイルの再生を停止しました。");
+                
+                // 停止時に音が残り続けないよう、すべてのチャンネル(0-15)に「オールサウンドオフ(CC 120)」と「ピッチベンドリセット」を送出
+                log("残響停止のため、オールサウンドオフを送信中...");
+                for(let ch=0; ch<16; ch++) {
+                    sendRawMidi([0xB0 + ch, 120, 0]); // All Sound Off
+                    sendRawMidi([0xB0 + ch, 121, 0]); // Reset All Controllers
+                    sendRawMidi([0xE0 + ch, 0, 64]);  // Center Pitch Bend
+                }
+            }
+        });
+    </script>
+</body>
+</html>
